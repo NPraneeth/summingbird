@@ -174,6 +174,7 @@ abstract class Storm(options: Map[String, Options], transformConfig: Summingbird
   }
 
   private def scheduleSpout(jobID: JobId, stormDag: Dag[Storm], node: StormNode)(implicit topologyBuilder: TopologyBuilder) = {
+
     val (spout, parOpt) = node.members.collect { case Source(SpoutSource(s, parOpt)) => (s, parOpt) }.head
     val nodeName = stormDag.getNodeName(node)
 
@@ -194,7 +195,6 @@ abstract class Storm(options: Map[String, Options], transformConfig: Summingbird
       }
     }
 
-    val countersForSpout: Seq[(Group, Name)] = JobCounters.getCountersForJob(jobID).getOrElse(Nil)
     val isMergeableWithSource = getOrElse(stormDag, node, DEFAULT_FM_MERGEABLE_WITH_SOURCE).get
     val sourceParallelism = getOrElse(stormDag, node, parOpt.getOrElse(DEFAULT_SOURCE_PARALLELISM)).parHint
     val flatMapParallelism = getOrElse(stormDag, node, DEFAULT_FM_PARALLELISM).parHint
@@ -202,9 +202,11 @@ abstract class Storm(options: Map[String, Options], transformConfig: Summingbird
     if (isMergeableWithSource) {
       require(flatMapParallelism <= sourceParallelism, s"SourceParallelism ($sourceParallelism) must be at least as high as FlatMapParallelism ($flatMapParallelism) when merging flatMap with Source")
     }
+
     val metrics = getOrElse(stormDag, node, DEFAULT_SPOUT_STORM_METRICS)
 
     val registerAllMetrics = Externalizer({ context: TopologyContext =>
+      val countersForSpout: Seq[(Group, Name)] = JobCounters.getCountersForJob(jobID).getOrElse(Nil)
       // Register metrics passed in SpoutStormMetrics option.
       metrics.metrics().foreach {
         x: StormMetric[IMetric] =>
@@ -215,38 +217,29 @@ abstract class Storm(options: Map[String, Options], transformConfig: Summingbird
       SummingbirdRuntimeStats.addPlatformStatProvider(StormStatProvider)
     })
     val hookedTormentaSpout = tormentaSpout.openHook(registerAllMetrics.get)
-
     val summerOpt: Option[SummerNode[Storm]] = stormDag.dependantsOf(node.asInstanceOf[StormNode]).collect { case s: SummerNode[Storm] => s }.headOption
-
     val stormSpout = summerOpt match {
-      /*
-         *  As the spout is being followed by a summer, we do not have map-side aggregation handled in the spout.
-         *  This means Summer is the place where the aggregation should happen.
-         */
-      case Some(s) => createSpoutToFeedSummer(stormDag, s, hookedTormentaSpout)
+      case Some(s) => createSpoutToFeedSummer[Any, Any](stormDag, s, jobID, hookedTormentaSpout)
       case None => hookedTormentaSpout.getSpout
     }
     topologyBuilder.setSpout(nodeName, stormSpout, sourceParallelism)
   }
 
-  private def createSpoutToFeedSummer(stormDag: Dag[Storm], node: StormNode, spout: Spout[(Timestamp, Any)]) = {
+  private def createSpoutToFeedSummer[K, V](stormDag: Dag[Storm], node: StormNode, jobID: JobId, spout: Spout[(Timestamp, Any)]) = {
+    val builder = BuildSummer(this, stormDag, node, jobID)
     val summerParalellism = getOrElse(stormDag, node, DEFAULT_SUMMER_PARALLELISM)
     val summerBatchMultiplier = getOrElse(stormDag, node, DEFAULT_SUMMER_BATCH_MULTIPLIER)
     val keyValueShards = executor.KeyValueShards(summerParalellism.parHint * summerBatchMultiplier.get)
-    /*
-     This method is called only when SourceNode is followed by SummerNode.
-     The Summer exists. There will be always not more than one summer, taken care by OnlinePlan.
-    */
-    val summerProducer = node.members.collect { case s: Summer[_, _, _] => s }.head.asInstanceOf[Summer[Storm, _, _]]
+
+    val summerProducer = node.members.collect { case s: Summer[_, _, _] => s }.head.asInstanceOf[Summer[Storm, K, V]]
     val batcher = summerProducer.store.mergeableBatcher
-    val kvinj = new KeyValueInjection[Int, CMap[(_, BatchID), (Timestamp, _)]]
+    val kvinj = new KeyValueInjection[(K, BatchID), (Timestamp, V)]
     val formattedSummerSpout = spout.map {
-      case (time, (k, v)) =>
-        val newK = keyValueShards.summerIdFor(k)
-        val m = CMap((k, batcher.batchOf(time)) -> (time, v))
-        kvinj((newK, m))
+      case (time, (k: K, v: V)) => kvinj((k, batcher.batchOf(time)), (time, v))
     }
-    new KeyValueSpout(formattedSummerSpout.getSpout)
+    implicit val valueMonoid: Semigroup[V] = summerProducer.semigroup
+    new KeyValueSpout[(K, BatchID), (Timestamp, V)](formattedSummerSpout.getSpout, builder, keyValueShards)
+
   }
 
   private def scheduleSummerBolt[K, V](jobID: JobId, stormDag: Dag[Storm], node: StormNode)(implicit topologyBuilder: TopologyBuilder) = {
